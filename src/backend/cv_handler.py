@@ -32,11 +32,17 @@ ROBUSTNESS:
 import os
 import shutil
 import logging
-import re
 import fitz  # PyMuPDF
-import docx # .docx
 from datetime import datetime
 import csv
+from docx import Document
+import sys
+import gc
+import json
+import re
+import time
+
+from src.backend.anonymizer import Anonymizer
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,7 @@ class CVHandler:
         Manejador de CVs para sistema de carpetas e IA Embebida.
         """
         self.analyzer = analyzer
+        self.anonymizer = Anonymizer()
         # Inicializamos en None o vacío. 
         # No creamos carpetas aquí para evitar duplicados al arrancar.
         self.base_output = None 
@@ -72,159 +79,149 @@ class CVHandler:
             return ""
         
     def _extract_text_from_docx(self, docx_path):
-        import sys
-        print(f"\n>>> HILO VIVO: Intentando abrir {docx_path}", flush=True)
-        
         try:
-            from docx import Document
-            print(">>> LIBRERÍA CARGADA CORRECTAMENTE", flush=True)
             doc = Document(docx_path)
-            
             text_parts = []
-
-            # 1. Extraer párrafos normales
             for para in doc.paragraphs:
                 if para.text.strip():
-                    text_parts.append(para.text)
-
-            # 2. Extraer texto dentro de TABLAS (Crucial para CVs de internet)
+                     text_parts.append(para.text)
             for table in doc.tables:
                 for row in table.rows:
                     for cell in row.cells:
-                        # Limpiamos el texto de la celda
-                        cell_text = cell.text.strip()
-                        if cell_text and cell_text not in text_parts:
-                            text_parts.append(cell_text)
-            
-            final_text = "\n".join(text_parts)
-            
-            # Verificación en terminal
-            if final_text.strip():
-                print(f"✅ ÉXITO: {len(final_text)} caracteres extraídos.", flush=True)
-            else:
-                print(f"⚠️ AVISO: El documento parece estar realmente vacío de texto.", flush=True)
-                
-            return final_text
-
+                        if cell.text.strip():
+                            text_parts.append(cell.text.strip())
+            return "\n".join(text_parts)
         except Exception as e:
-            print(f">>> ERROR DETECTADO: {e}", flush=True)
+            logger.error(f"Error en DOCX {docx_path}: {e}")
             return ""
         
     def _append_to_report(self, data):
+        """
+        Guarda los resultados en un archivo CSV dentro de la carpeta del proceso.
+        """
+        # Buscamos la carpeta del proceso actual
+        report_path = os.path.join(self.base_output, "resumen_clasificacion.csv")
         
-        if not self.base_output: # <--- Seguridad 
-            return
+        # Definimos las columnas
+        fieldnames = ['nombre', 'score', 'decision', 'motivo', 'ruta_final']
         
-        """Añade una fila al archivo CSV de resumen."""
-        report_path = os.path.join(self.base_output, "resumen_proceso.csv")
         file_exists = os.path.isfile(report_path)
-        
-        with open(report_path, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=["Archivo", "Score", "Motivo", "Decision"])
-            if not file_exists:
-                writer.writeheader() # Si es nuevo, escribe la cabecera
-            
-            writer.writerow({
-                "Archivo": os.path.basename(data["dest_path"]),
-                "Score": data["score"],
-                "Motivo": data["reason"],
-                "Decision": data["decision"]
-            })
+
+        try:
+            with open(report_path, 'a', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                # Si el archivo es nuevo, escribir la cabecera
+                if not file_exists:
+                    writer.writeheader()
+
+                # Escribimos la fila asegurando que las llaves coincidan
+                writer.writerow({
+                    'nombre': data.get('nombre', 'Desconocido'),
+                    'score': data.get('score', 0),
+                    'decision': data.get('decision', 'N/A'),
+                    'motivo': data.get('motivo', 'Sin motivo'),
+                    'ruta_final': data.get('dest_path', '')
+                })
+            print(f"📊 Registro añadido al CSV: {data.get('nombre')}")
+        except Exception as e:
+            print(f"❌ Error al escribir en CSV: {e}")
         
 
-    def process_cv(self, file_path: str, user_job_desc: str = None):
+    def process_cv(self, file_path: str, job_description: str = None):
         """
-        Analiza el CV y lo mueve físicamente según el score y guarda la razón.
+        Analiza el CV de forma anónima. Versión corregida sin duplicidad
+        y protegida contra errores de respuesta vacía.
         """
+        import os
+        import json
+        import shutil
+        import gc
+
         try:
             ext = os.path.splitext(file_path)[1].lower()
             
-            # --- Lógica Multiformato Ampliada ---
+            # 1. Extracción de texto
             if ext == ".pdf":
                 raw_text = self._extract_text_from_pdf(file_path)
             elif ext == ".docx":
                 raw_text = self._extract_text_from_docx(file_path)
             else:
-                # Soporte para .txt y otros formatos de texto plano
-                with open(file_path, 'r', encoding='utf-8') as f:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     raw_text = f.read()
 
             if not raw_text.strip():
-                return {"status": "error", "reason": "El archivo está vacío o no se pudo leer."}
+                return {"status": "error", "reason": "Archivo vacío o ilegible"}
             
-            jd = user_job_desc if user_job_desc else "Perfil técnico general"
-            decision = self.analyzer.analyze(raw_text, jd)
-            
-            # --- NUEVA LÓGICA DE EXTRACCIÓN (Score + Razón) ---
-            f_score = 0
-            reason = "No se pudo extraer una explicación detallada."
-            texto_ia = str(decision)
+            # 2. Anonimización y llamada a la IA
+            texto_para_la_nube = self.anonymizer.anonymize(raw_text)
+            # RECORTE DE SEGURIDAD: Evita el Segmentation Fault y mejora el enfoque de la IA
+            # Al limitar a 5000 caracteres, aseguras que no superas los 12K tokens del modelo versatile
+            texto_para_ia = texto_para_la_nube[:5000]
+            jd = job_description if job_description else "Perfil general"
+            decision_raw = self.analyzer.analyze(texto_para_la_nube, jd)
 
-            # 1. Extraer el score buscando específicamente la palabra "score" o el formato "XX%"
-            match_score = re.search(r'score["\']?\s*[:\-]\s*(\d+)', texto_ia.lower())
-            if match_score:
-                f_score = int(match_score.group(1))
+            # Limpieza inmediata de memoria
+            del texto_para_la_nube
+            del texto_para_ia
+            gc.collect()
+        
+            # Inicialización de variables de seguridad
+            f_score, reason, apto_ia = 0, "Error desconocido", "NO"
+
+            # 3. --- PROCESAMIENTO ROBUSTO DE LA RESPUESTA ---
+            if not decision_raw or not isinstance(decision_raw, str):
+                reason = "Error: La IA no devolvió respuesta. Revisa conexión o API Key."
             else:
-                # Si falla, busca números pero evita los de los formatos JSON
-                numeros = re.findall(r'\b\d{2,3}\b', texto_ia) # Busca números de 2 o 3 cifras
-                f_score = int(numeros[0]) if numeros else 0
+                try:
+                    # Limpieza de bordes: buscar el bloque JSON
+                    start = decision_raw.find('{')
+                    end = decision_raw.rfind('}') + 1
+                    
+                    if start != -1 and end > start:
+                        res_json = json.loads(decision_raw[start:end])
+                        f_score = float(res_json.get("score", 0))
+                        apto_ia = res_json.get("apto", "NO")
+                        reason = res_json.get("motivo", "")
+                        
+                        # Fallback: Si el motivo está vacío pero hay score
+                        if not reason or str(reason).strip().lower() in ["none", "null", ""]:
+                            if f_score >= 70:
+                                reason = "Cumple con los requisitos técnicos principales del puesto."
+                            elif f_score >= 50:
+                                reason = "Perfil con potencial o trayectoria histórica que requiere validación."
+                            else:
+                                reason = "No se detecta alineación técnica con la vacante."
+                    else:
+                        reason = "Error: La respuesta de la IA no contiene un formato JSON válido."
+                except Exception as e:
+                    reason = f"Error de interpretación en respuesta IA: {str(e)}"
 
-            # 2.--- EXTRACCIÓN DEL MOTIVO (Jerarquía de Seguridad) ---
-            # Plan A: Buscar formato JSON
-            match_json = re.search(r'["\']motivo["\']\s*:\s*["\'](.*?)(?=["\']\s*[,\}])', texto_ia, re.DOTALL | re.IGNORECASE)
-            # Plan B: Buscar texto natural (después de "motivo:")
-            match_natural = re.search(r'(?:motivo|razón|explicación)\s*[:\-]\s*(.*)', texto_ia, re.DOTALL | re.IGNORECASE)
-
-            if match_json:
-                reason = match_json.group(1).strip()
-            elif match_natural:
-                reason = match_natural.group(1).strip()
-            else:
-                reason = texto_ia.strip()
-
-            # Esto evita que se vean símbolos extraños en el Log de la pantalla
-            reason = reason.replace('\\xa0', ' ').replace('\\n', '\n').replace('\\"', '"').replace('\\', '').strip()
-
-            # --- Lógica de carpetas y Renombrado por Score ---
+            # 4. Clasificación física del archivo original
             nombre_original = os.path.basename(file_path)
-            
-            # Formateamos el score a 2 dígitos (ej: 05, 42, 98) para que el orden alfabético sea correcto
-            score_prefix = f"{int(f_score):02d}"
-            nuevo_nombre = f"{score_prefix}_{nombre_original}"
+            nuevo_nombre = f"{int(f_score):02d}_{nombre_original}"
 
-            # Verificamos si la IA puso "SI" en el campo apto del texto
-            es_apto_por_texto = '"apto": "SI"' in texto_ia.upper() or "'apto': 'SI'" in texto_ia.upper()
+            # Lógica de carpetas
+            destino = "RECLUTADOS" if f_score >= 70 or apto_ia.upper() == "SI" else \
+                      "DUDAS" if f_score >= 50 else "DESCARTADOS"
 
-            # Definición del destino según tu nueva escala (70, 50)
-            if f_score >= 70 or es_apto_por_texto:
-                destino = "RECLUTADOS"
-            elif 50 <= f_score < 70:
-                destino = "DUDAS"
-            else:
-                destino = "DESCARTADOS"
-
-            # Ruta final con el NUEVO NOMBRE (incluye el score delante)
             ruta_final = os.path.join(self.base_output, destino, nuevo_nombre)
             
             if os.path.exists(file_path):
-                # Usamos move pero con la ruta que contiene el nuevo_nombre
                 shutil.move(file_path, ruta_final)
 
-            self._append_to_report({
-                "dest_path": ruta_final,
-                "score": f_score,
-                "reason": reason,
-                "decision": destino
-            })
-
-            return {
+            # 5. Registro y Retorno
+            resultado = {
                 "status": "success",
                 "decision": destino,
                 "score": f_score,
-                "reason": reason,  
+                "motivo": reason.replace('\n', ' ').strip(),
+                "nombre": nombre_original,
                 "dest_path": ruta_final
             }
+            self._append_to_report(resultado)
+            time.sleep(15)  # Pausa para evitar saturar la IA con múltiples archivos en rápida sucesión
+            return resultado
 
         except Exception as e:
-            logger.error(f"❌ Error procesando {file_path}: {str(e)}")
             return {"status": "error", "reason": str(e)}

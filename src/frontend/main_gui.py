@@ -41,6 +41,7 @@ import queue
 import platform
 import subprocess
 from pathlib import Path
+import time
 
 # 3. Librerías de Interfaz Gráfica
 import tkinter
@@ -81,45 +82,83 @@ from src.backend.process_manager import ProcessManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Abrir el archivo conf.env
+from dotenv import load_dotenv
+
+# Fuerza la carga del archivo ANTES de que la interfaz decida qué mostrar
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# Si main_gui.py está en src/frontend, subimos dos niveles
+root_dir = os.path.dirname(os.path.dirname(script_dir)) 
+dotenv_path = os.path.join(root_dir, 'conf.env')
+
 
 class SmartCVFilterApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        
-        # 🚀 Inicialización de Backend
-        self.analyzer = CVAnalyzer() 
-        self.cv_handler = CVHandler(self.analyzer)
-        # 1. Define la 'Carpeta Madre' por defecto
-        self.default_dest_path = os.path.join(executable_path, "procesos_seleccion")
-        # Si no existe, se crea
-        if not os.path.exists(self.default_dest_path):
-            os.makedirs(self.default_dest_path)
-            logger.info(f"📁 Carpeta maestra creada en: {self.default_dest_path}")
+        self.withdraw()  # Evita que la ventana parpadee antes de configurar todo
 
-        # Pasa esta ruta al ProcessManager
-        self.process_manager = ProcessManager(executable_path, self.cv_handler)
-        self.results_dir = "" # Se llenará al dar a Clasificar
-        
-        # Configuración de la ventana
+        # 1. Configuración de la Ventana Principal (Establece la raíz de TK)
+        ctk.set_appearance_mode("dark")
+        self.configure(fg_color="#1a1a1a")
         self.title("Smart CV Filter")
         self.geometry("900x700")
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-
-        # Colas de comunicación
-        self.log_queue = queue.Queue()
         
-       # Variables de ruta inicializadas vacías
+
+        # 2. INICIALIZACIÓN DE RUTAS Y VARIABLES (Obligatorio antes de widgets)
+        self.default_dest_path = os.path.join(executable_path, "procesos_seleccion")
+        if not os.path.exists(self.default_dest_path):
+            os.makedirs(self.default_dest_path)
+            
         self.input_folder = ctk.StringVar(value="")
+        self.results_dir = ""
+        self.api_key = None
+        self.log_queue = queue.Queue()
 
-        # Crear Interfaz
+        # 2. INICIALIZACIÓN DE VARIABLES DE CONTROL (Obligatorio antes de widgets)
+        self.input_folder = ctk.StringVar(value="")
+        self.api_key = None
+            # Colas de comunicación (Indispensable para el hilo de log_text)
+        self.log_queue = queue.Queue()
+
+        # 3. Inicialización de Backend y Estado
+        self.analyzer = CVAnalyzer()
+        self.cv_handler = CVHandler(self.analyzer)
+        self.api_key = None
+        self.process_manager = ProcessManager(executable_path, self.cv_handler)
+        
+        # 4. Creación de Interfaz (Dibuja los widgets antes de cualquier diálogo)
         self.create_widgets()
+        self.update_idletasks()
         
-        # Iniciar bucle de revisión de colas
-        self.after(100, self.check_queues)
-        
-        # Cargar lista inicial
-        self.update_top_candidates()
+        # Mostrar la ventana ya renderizada en negro
+        self.deiconify()
+
+        # 5. Iniciar consumidores de colas
+        self.check_queues()
+
+        # 6. Verificación de Configuración con retraso (SOLUCIÓN VENTANA DOBLE)
+        self.after(200, self.verificar_configuracion_inicial)
+
+    def verificar_configuracion_inicial(self):
+        """Valida la API Key sin crear ventanas CTk adicionales."""
+        if self.analyzer.api_key:
+            self.api_key = self.analyzer.api_key
+            self.log_mensaje("✅ API Key cargada correctamente desde conf.env")
+        else:
+            self.api_key = self.solicitar_api_key()
+            
+        if self.api_key:
+            # ACTUALIZACIÓN: Solo el analizador necesita gestionar la clave directamente
+            self.analyzer.set_api_key(self.api_key)
+            # self.cv_handler.set_api_key(self.api_key)  <-- ELIMINA O COMENTA ESTA LÍNEA
+        else:
+            self.log_mensaje("🛑 No se proporcionó API Key.")
+
+    def log_mensaje(self, texto):
+        """Método auxiliar para escribir en el log de la UI de forma segura"""
+        if hasattr(self, 'log_text'):
+            self.log_text.insert("end", f"{texto}\n")
+            self.log_text.see("end")
 
     def create_widgets(self):
         # Frame principal con padding
@@ -309,6 +348,59 @@ class SmartCVFilterApp(ctk.CTk):
 
     # --- Lógica de la Aplicación ---
     
+    def solicitar_api_key(self):
+        """
+        Crea una ventana emergente para la API Key con soporte garantizado
+        para clic derecho (pegar) mediante inyección de eventos.
+        """
+        dialog = ctk.CTkInputDialog(
+            text="Introduce tu API Key de Groq:", 
+            title="Configuración inicial"
+        )
+        
+        # 1. Creamos el menú contextual una sola vez
+        menu_contextual = tkinter.Menu(self, tearoff=0)
+        
+        # 2. Función para inyectar el comando de pegado
+        def ejecutar_pegado(target):
+            try:
+                # Intentamos usar el comando universal de pegado del sistema
+                target.event_generate("<<Paste>>")
+            except:
+                # Fallback: intentar leer directamente del portapapeles de la app
+                try:
+                    texto = self.clipboard_get()
+                    target.insert(tkinter.INSERT, texto)
+                except:
+                    pass
+
+        # 3. Localización profunda del widget de entrada real
+        def configurar_eventos(parent):
+            for child in parent.winfo_children():
+                # Si encontramos el Entry (ya sea de CTk o de Tkinter puro)
+                if isinstance(child, (ctk.CTkEntry, tkinter.Entry)):
+                    # Configurar menú para este widget específico
+                    menu_contextual.delete(0, "end")
+                    menu_contextual.add_command(label="📋 Pegar", command=lambda: ejecutar_pegado(child))
+                    menu_contextual.add_command(label="✂️ Copiar", command=lambda: child.event_generate("<<Copy>>"))
+
+                    def mostrar_menu(event):
+                        child.focus_set() # Obligatorio para que sepa dónde pegar
+                        menu_contextual.tk_popup(event.x_root, event.y_root)
+                        return "break" # Evita que otros widgets procesen el clic
+
+                    # Vinculamos a todas las variantes de botón derecho/central
+                    child.bind("<Button-3>", mostrar_menu) # Windows/Linux
+                    child.bind("<Button-2>", mostrar_menu) # macOS/Linux Middle click
+                    
+                # Continuar buscando en profundidad
+                configurar_eventos(child)
+
+        # Lanzamos la configuración sobre el diálogo
+        self.after(100, lambda: configurar_eventos(dialog))
+        
+        return dialog.get_input()
+
     def update_top_candidates(self):
         # Limpiamos la lista actual
         for widget in self.candidates_list.winfo_children():
@@ -436,14 +528,25 @@ class SmartCVFilterApp(ctk.CTk):
                 self.log_queue.put(f"🔍 Analizando: {file_path.name}")
                 
                 resultado = self.cv_handler.process_cv(str(file_path), user_job_desc)
-                
+
                 if resultado.get("status") == "success":
-                    self.log_queue.put(f"   ✅ Score: {resultado['score']}% -> {resultado['decision']}")
-                    # --- AQUÍ SE MUESTRA EL MOTIVO ---
-                    self.log_queue.put(f"   💡 Motivo: {resultado['reason']}")
-                else:
-                    self.log_queue.put(f"   ❌ Error: {resultado.get('reason')}")
+                    # Usamos .get() con valores por defecto para evitar CRASHES
+                    score = resultado.get("score", 0)
+                    motivo = resultado.get("motivo", "No se proporcionó explicación")
+                    nombre = resultado.get("nombre", "Archivo")
+                    
+                    # 🟢 Pintar en el log 
+                    self.log_queue.put(f"✅ SCORE -> {score}%")
+                    self.log_queue.put(f"   💡 MOTIVO: {motivo}") 
+                    self.log_queue.put("-" * 45)
+                    self.log_queue.put("UPDATE_LIST")
+                    
                 
+                else:
+                    error_msg = resultado.get("reason", "Error desconocido")
+                    self.log_queue.put(f"❌ Error en {file_path.name}: {error_msg}")
+                
+                self.log_queue.put("⏳Reseteando tokens de Groq(15s)...") 
                 self.log_queue.put("-" * 40) # Una línea separadora un poco más larga
 
             self.log_queue.put("\n🎊 ¡Clasificación terminada!")

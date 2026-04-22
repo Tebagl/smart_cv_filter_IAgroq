@@ -1,15 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('src', 'src')]
+datas = [('src/backend', 'src/backend')]
 binaries = []
 hiddenimports = []
+hiddenimports += collect_submodules('cryptography')
+tmp_ret = collect_all('docx')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['src/frontend/main_gui.py'],
+    ['src\\frontend\\main_gui.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -29,7 +33,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SmartCVFilter_Cloud',
+    name='smart_cv_filter_v2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
